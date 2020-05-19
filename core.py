@@ -26,6 +26,7 @@ from pddlgym.planning import get_fd_optimal_plan_cost, get_pyperplan_heuristic
 import pyperplan
 
 import copy
+import functools
 import glob
 import os
 import tempfile
@@ -71,13 +72,20 @@ def _apply_effects(state, lifted_effects, assignments):
     return new_state
 
 
-def _make_heuristic(domain_file, problem_file, mode):
+def _make_heuristic(domain_file, problem_file, mode, cache_maxsize=10000):
     parser = pyperplan.Parser(domain_file, problem_file)
     domain = parser.parse_domain()
     problem = parser.parse_problem(domain)
 
     task = pyperplan.grounding.ground(problem)
-    return pyperplan.HEURISTICS[mode](task)
+    heuristic = pyperplan.HEURISTICS[mode](task)
+
+    @functools.lru_cache(cache_maxsize)
+    @functools.wraps(heuristic.__call__)
+    def _call_heuristic(state):
+        return heuristic(state)
+
+    return _call_heuristic
 
 
 class PDDLEnv(gym.Env):
@@ -213,7 +221,7 @@ class PDDLEnv(gym.Env):
             self._current_heuristic = self.compute_heuristic(state)
 
     def get_state(self):
-        return set(self._state)
+        return frozenset(self._state)
 
     def seed(self, seed):
         self._seed = seed
@@ -494,8 +502,9 @@ class PDDLEnv(gym.Env):
                 except FileNotFoundError:
                     pass
         else:
-            return self._heuristic(state)
-
+            state = frozenset({lit.pddl_str() for lit in state})
+            node = pyperplan.search.searchspace.make_root_node(state)
+            return self._heuristic(node)
 
     def _is_goal_reached(self, state):
         """
