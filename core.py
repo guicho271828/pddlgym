@@ -21,7 +21,10 @@ from pddlgym.structs import ground_literal, Literal, State
 from pddlgym.spaces import LiteralSpace, LiteralSetSpace
 from pddlgym.planning import get_fd_optimal_plan_cost, get_pyperplan_heuristic
 
+import pyperplan
+
 import copy
+import functools
 import glob
 import os
 import tempfile
@@ -31,7 +34,6 @@ import gym
 import numpy as np
 
 TMP_PDDL_DIR = "/dev/shm" if os.path.exists("/dev/shm") else None
-
 
 
 class InvalidAction(Exception):
@@ -67,6 +69,23 @@ def _apply_effects(state, lifted_effects, assignments):
             new_literals.add(effect)
     new_state = State(frozenset(new_literals), state.objects)
     return new_state
+
+
+def _make_heuristic(domain_file, problem_file, mode, cache_maxsize=10000):
+    parser = pyperplan.Parser(domain_file, problem_file)
+    domain = parser.parse_domain()
+    problem = parser.parse_problem(domain)
+
+    task = pyperplan.grounding.ground(problem)
+    heuristic = pyperplan.HEURISTICS[mode](task)
+
+    @functools.lru_cache(cache_maxsize)
+    def _call_heuristic(state):
+        state = frozenset({lit.pddl_str() for lit in state.literals})
+        node = pyperplan.search.searchspace.make_root_node(state)
+        return heuristic(node)
+
+    return _call_heuristic
 
 
 class PDDLEnv(gym.Env):
@@ -109,7 +128,8 @@ class PDDLEnv(gym.Env):
                  raise_error_on_invalid_action=False,
                  operators_as_actions=False,
                  dynamic_action_space=False,
-                 shape_reward_mode=None):
+                 shape_reward_mode=None,
+                 shaping_discount=1.):
         self._state = None
         self._domain_file = domain_file
         self._problem_dir = problem_dir
@@ -118,8 +138,12 @@ class PDDLEnv(gym.Env):
         self._raise_error_on_invalid_action = raise_error_on_invalid_action
         self.operators_as_actions = operators_as_actions
 
+        if shape_reward_mode == "none":
+            shape_reward_mode = None
         self._shape_reward_mode = shape_reward_mode
+        self._shaping_discount = shaping_discount
         self._current_heuristic = None
+        self._heuristic = None
 
         # Set by self.fix_problem_index
         self._problem_index_fixed = False
@@ -227,6 +251,13 @@ class PDDLEnv(gym.Env):
             self._problem_idx = self.rng.choice(len(self.problems))
         self._problem = self.problems[self._problem_idx]
 
+        # Create new heuristic if using reward shaping and either the problem
+        # isn't fixed or no heuristic has been created yet.
+        if (self._shape_reward_mode is not None
+                and self._shape_reward_mode != "optimal"
+                and (not self._problem_index_fixed or self._heuristic is None)):
+            self._heuristic = self.make_heuristic_function(self._shape_reward_mode)
+
         # reset the current heuristic
         self._current_heuristic = None
         initial_state = State(frozenset(self._problem.initial_state),
@@ -237,6 +268,13 @@ class PDDLEnv(gym.Env):
         debug_info = self._get_debug_info()
 
         return self.get_state(), debug_info
+
+    def make_heuristic_function(self, mode):
+        return _make_heuristic(
+                self._domain_file,
+                self._problem.problem_fname,
+                mode=mode,
+            )
 
     def _get_debug_info(self):
         """
@@ -327,6 +365,8 @@ class PDDLEnv(gym.Env):
         """
         state, reward, done, debug_info = self.sample_transition(action)
         self.set_state(state)
+        if "next_state_heuristic" in debug_info:
+            self._current_heuristic = debug_info["next_state_heuristic"]
         return state, reward, done, debug_info
 
     def sample_transition(self, action):
@@ -349,13 +389,13 @@ class PDDLEnv(gym.Env):
         done = self._is_goal_reached(state)
 
         reward = self.extrinsic_reward(state, done)
+        debug_info = self._get_debug_info()
 
         # add intrinsic reward
         if self._shape_reward_mode:
-            next_heuristic = self.compute_heuristic(state)
-            reward += self._current_heuristic - next_heuristic
-
-        debug_info = self._get_debug_info()
+            next_heuristic = 0. if done else self.compute_heuristic(state)
+            reward += self._current_heuristic - next_heuristic * self._shaping_discount
+            debug_info["next_state_heuristic"] = next_heuristic
 
         return state, reward, done, debug_info
 
@@ -371,30 +411,30 @@ class PDDLEnv(gym.Env):
         """Compute the heuristic for a given state in the current problem.
         """
         problem = self.problems[self._problem_idx]
-        # Add action literals to state to enable planning
-        state_lits = set(state.literals)
-        action_lits = set(self.action_space.all_ground_literals(state, 
-            valid_only=False))
-        state_lits |= action_lits
 
-        problem_path = ""
-        try:
-            # generate a temporary file to hand over to the external planner
-            fd, problem_path = tempfile.mkstemp(dir=TMP_PDDL_DIR, text=True)
-            with os.fdopen(fd, "w") as f:
-                problem.write(f, initial_state=state_lits, fast_downward_order=True)
+        if self._shape_reward_mode == "optimal":
+            # Add action literals to state to enable planning
+            state_lits = set(state.literals)
+            action_lits = set(
+                self.action_space.all_ground_literals(state, valid_only=False))
+            state_lits |= action_lits
 
-            if self._shape_reward_mode == "optimal":
+            problem_path = ""
+            try:
+                # generate a temporary file to hand over to the external planner
+                fd, problem_path = tempfile.mkstemp(dir=TMP_PDDL_DIR, text=True)
+                with os.fdopen(fd, "w") as f:
+                    problem.write(f, initial_state=state_lits, fast_downward_order=True)
+
                 return get_fd_optimal_plan_cost(
                     self.domain.domain_fname, problem_path)
-            else:
-                return get_pyperplan_heuristic(
-                    self._shape_reward_mode, self.domain.domain_fname, problem_path)
-        finally:
-            try:
-                os.remove(problem_path)
-            except FileNotFoundError:
-                pass
+            finally:
+                try:
+                    os.remove(problem_path)
+                except FileNotFoundError:
+                    pass
+        else:
+            return self._heuristic(state)
 
     def _is_goal_reached(self, state):
         """
